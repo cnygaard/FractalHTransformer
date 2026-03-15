@@ -1,0 +1,27 @@
+__pycache__/
+*.png
+
+# Model checkpoints and artifacts
+*.pt
+*.db
+*.csv
+
+# JSON artifacts (but keep tokenizers)
+optimizer_comparison.json
+optimization_summary.txt
+
+# Training logs
+runs/
+checkpoints/
+checkpoints_production/
+
+# Environment
+.env
+.venv/
+
+# Infrastructure
+infra/
+
+# Claude
+.claude/
+CLAUDE.md
