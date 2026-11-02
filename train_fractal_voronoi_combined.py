@@ -15,7 +15,7 @@ from tqdm import tqdm
 import os
 import time
 import math
-import re
+import itertools
 from collections import defaultdict
 from typing import Dict, Tuple, Optional
 
@@ -24,31 +24,40 @@ from fractal_gpt_production import ProductionFractalGPT
 from llm_fractal_training import FractalTransformerConfig
 
 import local_logger as metrics_logger
+from wikitext_data import WIKITEXT_REPO, WIKITEXT_TOKENIZER, detokenize_wikitext, wikitext_windows
 
-# WikiText is pre-tokenized: "1 @,@ 000", "word , word", "game 's", "( text )"
-_WIKI_AT_MARKER = re.compile(r' @([-,.])@ ')
-_WIKI_SPACE_BEFORE = re.compile(r" (?=[,;:!?)\]]|\.(?!\d)|'s\b|n't\b|'(?=\s))")
-_WIKI_SPACE_AFTER = re.compile(r'(?<=[(\[]) ')
+TINYSTORIES_TOKENIZER = 'fractal_gpt_tokenizer_8k.json'
 
-
-def detokenize_wikitext(text):
-    """Undo WikiText's punctuation spacing so it matches natural text"""
-    text = _WIKI_AT_MARKER.sub(r'\1', text)
-    text = _WIKI_SPACE_BEFORE.sub('', text)
-    return _WIKI_SPACE_AFTER.sub('', text)
+DATA_DESCRIPTIONS = {
+    'mixed': 'TinyStories + WikiText-2',
+    'tinystories': 'TinyStories only',
+    'wikitext': 'WikiText-103 only',
+}
 
 
 class FractalVoronoiDataset(torch.utils.data.IterableDataset):
-    """Dataset for training -- supports TinyStories only or mixed mode"""
+    """Dataset for training -- data is 'mixed' (TinyStories + WikiText-2), 'tinystories' or 'wikitext' (WikiText-103)"""
 
-    def __init__(self, tokenizer, max_length=256, tinystories_only=False):
+    def __init__(self, tokenizer, max_length=256, data='mixed'):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.tinystories_only = tinystories_only
+        self.data = data
 
-        self.stories = load_dataset('roneneldan/TinyStories', split='train', streaming=True)
-        if not tinystories_only:
-            self.wiki = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='train', streaming=True)
+        self.stories = None
+        self.wiki = None
+        if data != 'wikitext':
+            self.stories = load_dataset('roneneldan/TinyStories', split='train', streaming=True)
+        if data == 'mixed':
+            self.wiki = load_dataset(WIKITEXT_REPO, 'wikitext-2-raw-v1', split='train', streaming=True)
+        elif data == 'wikitext':
+            self.wiki = load_dataset(WIKITEXT_REPO, 'wikitext-103-raw-v1', split='train', streaming=True)
+
+    @staticmethod
+    def _to_example(sequence):
+        return {
+            'input_ids': torch.tensor(sequence[:-1], dtype=torch.long),
+            'labels': torch.tensor(sequence[1:], dtype=torch.long),
+        }
 
     def _process_text(self, text, detokenize=False):
         """Tokenize and yield sequences from text"""
@@ -61,14 +70,17 @@ class FractalVoronoiDataset(torch.utils.data.IterableDataset):
         for i in range(0, len(tokens) - self.max_length, self.max_length // 4):
             sequence = tokens[i:i + self.max_length]
             if len(sequence) == self.max_length:
-                yield {
-                    'input_ids': torch.tensor(sequence[:-1], dtype=torch.long),
-                    'labels': torch.tensor(sequence[1:], dtype=torch.long),
-                }
+                yield self._to_example(sequence)
 
     def __iter__(self):
+        if self.data == 'wikitext':
+            # One continuous token stream, restarted at the end of the split
+            while True:
+                for sequence in wikitext_windows(self.tokenizer, self.wiki, self.max_length):
+                    yield self._to_example(sequence)
+
         stories_iter = iter(self.stories)
-        wiki_iter = iter(self.wiki) if not self.tinystories_only else None
+        wiki_iter = iter(self.wiki) if self.wiki is not None else None
 
         while True:
             # TinyStories
@@ -146,15 +158,17 @@ def train_fractal_voronoi(config: dict):
             # Update config with checkpoint's config
             if 'config' in checkpoint_data:
                 old_config = checkpoint_data['config']
-                # Preserve new settings but use model architecture from checkpoint
+                # Preserve new settings but use model architecture and tokenizer from checkpoint
                 for key in ['hidden_dim', 'num_layers', 'num_heads', 'vocab_size', 'max_seq_length']:
                     if key in old_config:
                         config[key] = old_config[key]
+                # Checkpoints from before --wikitext were all trained with the TinyStories tokenizer
+                config['tokenizer'] = old_config.get('tokenizer', TINYSTORIES_TOKENIZER)
         else:
             print(f"Warning: Checkpoint {checkpoint_path} not found, starting fresh")
     
     # Load tokenizer
-    tokenizer = Tokenizer.from_file("fractal_gpt_tokenizer_8k.json")
+    tokenizer = Tokenizer.from_file(config.get('tokenizer', TINYSTORIES_TOKENIZER))
     
     # Create model
     model = create_fractal_voronoi_model(config)
@@ -169,10 +183,8 @@ def train_fractal_voronoi(config: dict):
     print(f"\nModel parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Create dataset
-    dataset = FractalVoronoiDataset(
-        tokenizer, config['max_seq_length'],
-        tinystories_only=config.get('tinystories_only', False)
-    )
+    data = config.get('data', 'mixed')
+    dataset = FractalVoronoiDataset(tokenizer, config['max_seq_length'], data=data)
     dataloader = DataLoader(
         dataset,
         batch_size=config['batch_size'],
@@ -219,6 +231,8 @@ def train_fractal_voronoi(config: dict):
     
     # Initialize logger
     run_name = f"fractal_voronoi_{config['hidden_dim']}d_{config['num_layers']}L"
+    if data == 'wikitext':
+        run_name += "_wikitext"  # different tokenizer, keep checkpoints apart
     metrics_logger.init(
         project="fractal-voronoi",
         config=config,
@@ -240,7 +254,7 @@ def train_fractal_voronoi(config: dict):
     print("Features:")
     print("  - FractalGPT hierarchical architecture with causal masking")
     print("  - AdamW optimizer")
-    print("  - Mixed data sources (TinyStories + WikiText)")
+    print(f"  - Data: {DATA_DESCRIPTIONS[data]}")
     
     # Adjust for resumption
     total_epochs = config['num_epochs']
@@ -317,7 +331,7 @@ def train_fractal_voronoi(config: dict):
             # Periodic evaluation
             if global_step % 1000 == 0 and global_step > 0:
                 print(f"\nEvaluating at step {global_step}...")
-                val_loss = evaluate_model(model, tokenizer, device)
+                val_loss = evaluate_model(model, tokenizer, device, data, config['max_seq_length'])
                 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -336,7 +350,7 @@ def train_fractal_voronoi(config: dict):
 
         # Test generation
         print("\nSample generation:")
-        test_generation(model, tokenizer, device)
+        test_generation(model, tokenizer, device, data=data)
     
     # Final save
     final_path = f"{run_name}_final.pt"
@@ -346,38 +360,47 @@ def train_fractal_voronoi(config: dict):
     metrics_logger.finish()
 
 
-def evaluate_model(model, tokenizer, device):
+def validation_sequences(tokenizer, data='mixed', max_length=256, count=50):
+    """Small validation set as lists of token ids (TinyStories unless training on WikiText only)"""
+    if data == 'wikitext':
+        val_data = load_dataset(WIKITEXT_REPO, 'wikitext-103-raw-v1', split='validation', streaming=True)
+        return list(itertools.islice(wikitext_windows(tokenizer, val_data, max_length), count))
+
+    sequences = []
+    val_data = load_dataset('roneneldan/TinyStories', split='validation', streaming=True)
+    for i, example in enumerate(val_data):
+        if i >= count:  # Quick evaluation
+            break
+
+        text = example.get('text', '')
+        if text and len(text) > 100:
+            ids = tokenizer.encode(text[:500]).ids  # Limit length
+            if len(ids) > 10:
+                sequences.append(ids)
+    return sequences
+
+
+def evaluate_model(model, tokenizer, device, data='mixed', max_length=256):
     """Quick evaluation on validation data"""
     model.eval()
-    
+
     # Simple validation loss calculation
     val_losses = []
-    
-    # Create small validation set
-    val_data = load_dataset('roneneldan/TinyStories', split='validation', streaming=True)
-    
+
     with torch.no_grad():
-        for i, example in enumerate(val_data):
-            if i >= 50:  # Quick evaluation
-                break
-                
-            text = example.get('text', '')
-            if text and len(text) > 100:
-                encoding = tokenizer.encode(text[:500])  # Limit length
-                tokens = torch.tensor(encoding.ids).unsqueeze(0).to(device)
-                
-                if tokens.size(1) > 10:
-                    input_ids = tokens[:, :-1]
-                    labels = tokens[:, 1:]
-                    
-                    outputs = model(input_ids)
-                    logits = outputs['logits'] if isinstance(outputs, dict) else outputs
-                    
-                    loss = F.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1)
-                    )
-                    val_losses.append(loss.item())
+        for ids in validation_sequences(tokenizer, data, max_length):
+            tokens = torch.tensor(ids).unsqueeze(0).to(device)
+            input_ids = tokens[:, :-1]
+            labels = tokens[:, 1:]
+
+            outputs = model(input_ids)
+            logits = outputs['logits'] if isinstance(outputs, dict) else outputs
+
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1)
+            )
+            val_losses.append(loss.item())
     
     avg_val_loss = np.mean(val_losses) if val_losses else float('inf')
     print(f"  Validation loss: {avg_val_loss:.3f}")
@@ -386,11 +409,14 @@ def evaluate_model(model, tokenizer, device):
     return avg_val_loss
 
 
-def test_generation(model, tokenizer, device, num_samples=3):
+def test_generation(model, tokenizer, device, num_samples=3, data='mixed'):
     """Test text generation quality"""
     model.eval()
-    
-    prompts = ["Once upon a time", "The little girl", "In a magical forest"]
+
+    if data == 'wikitext':
+        prompts = ["The city of", "In the early 20th century", "The album was"]
+    else:
+        prompts = ["Once upon a time", "The little girl", "In a magical forest"]
     
     for prompt in prompts[:num_samples]:
         encoding = tokenizer.encode(prompt)
@@ -449,7 +475,9 @@ def main():
     parser.add_argument('--lr', type=float, help='Override learning rate')
     parser.add_argument('--resume', type=str, help='Resume from checkpoint file')
     parser.add_argument('--start-epoch', type=int, help='Starting epoch (for resuming)')
-    parser.add_argument('--tinystories', action='store_true', help='Train on TinyStories only (easier, lower loss)')
+    data_group = parser.add_mutually_exclusive_group()
+    data_group.add_argument('--tinystories', action='store_true', help='Train on TinyStories only (easier, lower loss)')
+    data_group.add_argument('--wikitext', action='store_true', help='Train on WikiText-103 only (uses the WikiText tokenizer)')
     
     args = parser.parse_args()
     
@@ -510,8 +538,13 @@ def main():
     
     # Data settings
     if args.tinystories:
-        config['tinystories_only'] = True
-        print("Training on TinyStories only")
+        config['data'] = 'tinystories'
+    elif args.wikitext:
+        config['data'] = 'wikitext'
+    else:
+        config['data'] = 'mixed'
+    config['tokenizer'] = WIKITEXT_TOKENIZER if config['data'] == 'wikitext' else TINYSTORIES_TOKENIZER
+    print(f"Training on {DATA_DESCRIPTIONS[config['data']]}")
 
     # Resume settings
     if args.resume:
