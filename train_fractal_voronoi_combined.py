@@ -15,6 +15,7 @@ from tqdm import tqdm
 import os
 import time
 import math
+import re
 from collections import defaultdict
 from typing import Dict, Tuple, Optional
 
@@ -23,6 +24,18 @@ from fractal_gpt_production import ProductionFractalGPT
 from llm_fractal_training import FractalTransformerConfig
 
 import local_logger as metrics_logger
+
+# WikiText is pre-tokenized: "1 @,@ 000", "word , word", "game 's", "( text )"
+_WIKI_AT_MARKER = re.compile(r' @([-,.])@ ')
+_WIKI_SPACE_BEFORE = re.compile(r" (?=[,;:!?)\]]|\.(?!\d)|'s\b|n't\b|'(?=\s))")
+_WIKI_SPACE_AFTER = re.compile(r'(?<=[(\[]) ')
+
+
+def detokenize_wikitext(text):
+    """Undo WikiText's punctuation spacing so it matches natural text"""
+    text = _WIKI_AT_MARKER.sub(r'\1', text)
+    text = _WIKI_SPACE_BEFORE.sub('', text)
+    return _WIKI_SPACE_AFTER.sub('', text)
 
 
 class FractalVoronoiDataset(torch.utils.data.IterableDataset):
@@ -35,12 +48,14 @@ class FractalVoronoiDataset(torch.utils.data.IterableDataset):
 
         self.stories = load_dataset('roneneldan/TinyStories', split='train', streaming=True)
         if not tinystories_only:
-            self.wiki = load_dataset('wikitext', 'wikitext-2-v1', split='train', streaming=True)
+            self.wiki = load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='train', streaming=True)
 
-    def _process_text(self, text):
+    def _process_text(self, text, detokenize=False):
         """Tokenize and yield sequences from text"""
         if not text or len(text) < 50 or text.count(' ') < 5:
             return
+        if detokenize:
+            text = detokenize_wikitext(text)
         encoding = self.tokenizer.encode(text)
         tokens = encoding.ids
         for i in range(0, len(tokens) - self.max_length, self.max_length // 4):
@@ -67,7 +82,7 @@ class FractalVoronoiDataset(torch.utils.data.IterableDataset):
             if wiki_iter is not None:
                 try:
                     example = next(wiki_iter)
-                    yield from self._process_text(example.get('text', ''))
+                    yield from self._process_text(example.get('text', ''), detokenize=True)
                 except StopIteration:
                     wiki_iter = iter(self.wiki)
 
