@@ -41,6 +41,9 @@ python train_fractal_voronoi_combined.py --small --tinystories
 # Train on mixed TinyStories + WikiText
 python train_fractal_voronoi_combined.py --medium
 
+# Train on WikiText-103 only
+python train_fractal_voronoi_combined.py --medium --wikitext
+
 # Custom settings
 python train_fractal_voronoi_combined.py --medium --tinystories --steps 5000 --epochs 20 --lr 3e-4
 ```
@@ -49,6 +52,7 @@ python train_fractal_voronoi_combined.py --medium --tinystories --steps 5000 --e
 
 - `--tiny`, `--small`, `--medium`: Model size presets
 - `--tinystories`: Train on TinyStories only (simpler distribution, lower achievable loss)
+- `--wikitext`: Train on WikiText-103 only, with the byte-level BPE tokenizer `fractal_gpt_tokenizer_wikitext_8k.json` (rebuild it with `python train_wikitext_tokenizer.py`). Validation also uses WikiText, so losses aren't comparable to TinyStories runs
 - `--steps N`: Steps per epoch
 - `--epochs N`: Number of epochs
 - `--lr RATE`: Learning rate
@@ -59,6 +63,8 @@ python train_fractal_voronoi_combined.py --medium --tinystories --steps 5000 --e
 - `fractal_gpt_production.py` -- Model architecture (attention, layers, FractalGPT)
 - `llm_fractal_training.py` -- Configuration and fractal layer distribution
 - `train_fractal_voronoi_combined.py` -- Training script with data loading and evaluation
+- `wikitext_data.py` -- WikiText detokenization and token-stream windowing
+- `train_wikitext_tokenizer.py` -- Trains the WikiText-103 tokenizer
 - `ellipsoid_core.py` -- Ellipsoid geometry primitives
 - `fractal_tree.py` -- Fractal tree decomposition
 - `adaptive_moments.py` -- Hierarchical moment tracking
